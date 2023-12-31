@@ -14,75 +14,94 @@ tf.keras.backend.clear_session()
 
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 
-def extract_data(text, no_diacritics_dumpfile = None, labels_dumpfile = None):
-    no_diacritics = remove_diacritics(text)
-    labels = np.zeros((len(no_diacritics), 2)).astype(np.int16)
-    j = -1
-    k = 0
-    for i in range(len(text)):
-        if 0x64B <= ord(text[i]) <= 0x652:
-            labels[j, k] = ord(text[i])
-            k += 1
-        else:
-            j += 1
-            k = 0
-    if no_diacritics_dumpfile is not None:
-        with open(no_diacritics_dumpfile, 'wb') as f:
-            pickle.dump(no_diacritics, f)
-    if labels_dumpfile is not None:
-        with open(labels_dumpfile, 'wb') as f:
-            pickle.dump(labels, f)
-    return no_diacritics, labels
+diacritic2id = pickle.load(open('diacritic2id.pickle', 'rb'))
+id2diacritic = {v: k for k, v in diacritic2id.items()}
+PAD = chr(0)
+SOS = chr(1)
+EOS = chr(2)
 
 def remove_diacritics(text):
     return re.sub(r'[\u064B-\u0652]', '', text)
 
-def extract_sentences(text, labels, max_len):
-    sentences_list = text.split('.')
+def extract_sentences(text):
+    return [SOS + sentence + EOS for sentence in text.split('.')]
 
-    sentences = np.zeros((len(sentences_list), max_len)).astype(np.int16)
-    diacritics = np.zeros((len(sentences_list), max_len, 2)).astype(np.int16)
+def extract_data_single(sentence):
+    no_diacritics = remove_diacritics(sentence)
+    labels = np.full((len(no_diacritics)), diacritic2id[''], dtype = np.uint8)
+    cur_label = ''
+    k = -1
+    for i in range(len(sentence)):
+        if 0x64B <= ord(sentence[i]) <= 0x652:
+            cur_label += sentence[i]
+            labels[k] = diacritic2id[cur_label]
+        else:
+            k += 1
+            cur_label = ''
 
-    j = 0
-    for i, sentence in enumerate(sentences_list):
-        last_space = sentence.rfind(' ', 0, max_len) + 1
+    return no_diacritics, labels
 
-        if last_space == -1: 
-            j += len(sentence) + 1
-            continue
+def extract_data(sentences):
+    no_diacritics = []
+    labels = []
+    for sentence in sentences:
+        no_diacritics_sentence, labels_sentence = extract_data_single(sentence)
+        no_diacritics.append(no_diacritics_sentence)
+        labels.append(labels_sentence)
+    return no_diacritics, labels
 
-        sentences[i, :last_space] = np.array([ord(char) for char in sentence[:last_space]], dtype=np.uint16)
-        diacritics[i, :last_space] = labels[j : j + last_space]
+def encode_sentence(sentence):
+    sentence_encoded = np.array([ord(c) for c in sentence], dtype = np.uint16)
+    return sentence_encoded
 
-        j += len(sentence) + 1
+def encode_sentences(sentences, labels):
+    sentences_encoded = np.zeros((len(sentences), len(sentences[0])), dtype = np.uint16)
+    labels_encoded = np.zeros((len(sentences), len(sentences[0])), dtype = np.uint8)
+    for i, sentence in enumerate(sentences):
+        sentences_encoded[i] = encode_sentence(sentence)
+        labels_encoded[i] = labels[i]
+    return sentences_encoded, labels_encoded
+
+def extract_features(text, max_len):
+    sentences = extract_sentences(text)
+    sentences_no_diac, labels = extract_data(sentences)
+    sentences_no_diac_clamped, labels_clamped = clamp_sentences(sentences_no_diac, labels, max_len)
+    sentences_encoded, labels_encoded = encode_sentences(sentences_no_diac_clamped, labels_clamped)
+    return sentences_encoded, labels_encoded
+
+def clamp_sentence(sentence, labels, max_len):
+    i = 1
+    if max_len >= len(sentence):
+        i = len(sentence)
+    else: 
+        i = sentence.rfind(' ', 0, max_len) + 1
     
-    return sentences, diacritics
+    sentence_padded = sentence[:i] + PAD * (max_len - i)    
+    labels_padded = np.hstack((labels[:i], np.full((max_len - i), diacritic2id[''], dtype = np.uint8)))
+    return sentence_padded, labels_padded
 
-def diacritize_string(sentence_str, model, sentence_encoder, label_encoder, label_encoder2, max_len):
-    sentence = np.array([ord(char) for char in sentence_str], dtype=np.uint16)
-    sentence = sentence_encoder.transform(sentence)
+def clamp_sentences(sentences, labels, max_len):
+    sentences_clamped = []
+    labels_clamped = []
+    for i in range(len(sentences)):
+        sentence_clamped, sentence_labels_clamped = clamp_sentence(sentences[i], labels[i], max_len)
+        sentences_clamped.append(sentence_clamped)
+        labels_clamped.append(sentence_labels_clamped)
+    return sentences_clamped, labels_clamped
 
-    if len(sentence) > max_len:
-        sentence = sentence[:max_len]
-    else:
-        sentence = np.pad(sentence, (0, max_len - len(sentence)), constant_values=0)
-
-    sentence = sentence.reshape(1, max_len)
-
+def diacritize_string(sentence_test_str, model, sentence_encoder, max_len):
+    sentence = SOS + sentence_test_str + EOS
+    sentence_no_diacritics, labels = extract_data_single(sentence)
+    sentence_no_diac_clamped, labels_clamped = clamp_sentence(sentence_no_diacritics, labels, max_len)
+    sentence, labels_encoded = encode_sentences(sentence_no_diac_clamped, labels_clamped)
+    sentence = sentence_encoder.transform(sentence.reshape(-1)).reshape(1, -1)
     pred = model.predict(sentence)
+
     pred = np.argmax(pred, axis=-1).flatten()
-    pred = label_encoder2.inverse_transform(pred)
-    pred1 = pred // 9
-    pred2 = pred % 9
-    pred1 = label_encoder.inverse_transform(pred1)
-    pred2 = label_encoder.inverse_transform(pred2)
 
     sentence = ''
-    for i in range(len(sentence_str)):
-        sentence += sentence_str[i]
-        if pred1[i] != 0:
-            sentence += chr(pred1[i])
-        if pred2[i] != 0:
-            sentence += chr(pred2[i])
+    for i in range(len(sentence_no_diacritics)):
+        sentence += sentence_no_diacritics[i]
+        sentence += id2diacritic[pred[i]]
             
     return sentence
