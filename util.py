@@ -170,6 +170,7 @@ def clean(dataset_str):
     return dataset_str
 
 def Test(test_sentences, model, sentence_encoder, max_len = 500):
+    model.eval()
     # test_sentences: el text el kbeer bta3 el test (kaza gomla 3ady b dots b 3ak kteer kda)
     # model: el model el hn-predict byh
     # sentence_encoder: el encoder el hn-convert el text le numbers
